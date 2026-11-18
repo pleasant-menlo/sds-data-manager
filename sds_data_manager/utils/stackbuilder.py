@@ -26,6 +26,7 @@ from sds_data_manager.constructs import (
     ialirt_processing_construct,
     ialirt_realtime_construct,
     ialirt_schedule_fetch_construct,
+    ialirt_ssr_construct,
     indexer_lambda_construct,
     instrument_lambdas,
     lambda_layer_construct,
@@ -238,7 +239,8 @@ def build_sds(
         spin_threshold_days=4,
         sclk_threshold_days=4,
         repoint_threshold_days=4,
-        predicted_ephemeris_threshold_days=4,
+        # Predicted ephemeris arrives about every two weeks.
+        predicted_ephemeris_threshold_days=21,
     )
 
     sds_api_manager_construct.SdsApiManager(
@@ -334,7 +336,10 @@ def build_sds(
 
     # create EFS
     ialirt_efs_instance = ialirt_efs_construct.IAlirtEFSConstruct(
-        scope=ialirt_stack, construct_id="IAlirtEFSConstruct", vpc=networking.vpc
+        scope=ialirt_stack,
+        construct_id="IAlirtEFSConstruct",
+        vpc=networking.vpc,
+        account_name=account_name,
     )
 
     # I-ALiRT IOIS ingest lambda (facilitates s3 to dynamodb)
@@ -437,6 +442,22 @@ def build_sds(
 
     ialirt_noaa_vpn.build_noaa_vpn_tgw(ialirt_stack, networking)
 
+    # I-ALiRT SSR Stack
+    ialirt_ssr_stack = Stack(
+        scope, "IalirtSsrStack", cross_region_references=True, env=env
+    )
+
+    # SSR always reads prod data, since dev does not have the full history
+    # of L0, ancillary and SPICE files.
+    prod_domain_name = ialirt_ssr_stack.node.get_context("prod")["domain_name"]
+    ialirt_ssr_construct.IalirtSsrConstruct(
+        scope=ialirt_ssr_stack,
+        construct_id="IalirtSsrConstruct",
+        account_name=account_name,
+        vpc=networking.vpc,
+        data_access_url=f"https://api.{prod_domain_name}",
+    )
+
     reprocessing_tools_construct = instrument_lambdas.ReprocessingTools(
         scope=sdc_stack,
         construct_id="ReprocessingTools",
@@ -486,9 +507,7 @@ def build_sds(
         "SECRET_NAME": db_secret_name,
         "ACCOUNT": env.account,
         "REGION": env.region,
-        "IMAP_DATA_ACCESS_URL": account_config.get(
-            "imap_data_access_url", "https://api.dev.imap-mission.com"
-        ),
+        "IMAP_DATA_ACCESS_URL": general_data_access_url,
         "SSM_API_KEY_PARAMETER": "/imap-sdc/batch-jobs/api-key",
         "REPROCESSING_SQS_URL": reprocessing_tools_construct.reprocessing_sqs_url,
         "DAGSTER_PG_HOST": dg_host_name,

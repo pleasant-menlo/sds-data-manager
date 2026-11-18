@@ -60,6 +60,7 @@ class IalirtProcessing(Construct):
         self.s3_bucket_name = ialirt_bucket.bucket_name
         self.secret_name = secret_name
         self.region = env.region
+        self.account_name = account_name
 
         # Create security group in which containers will reside
         self.create_ecs_security_group()
@@ -93,11 +94,15 @@ class IalirtProcessing(Construct):
         partner_config = {
             "lasp": {  # used for testing only
                 "params": ["lasp"],
-                "ports": [7526, 7563, 7564, 7565, 7566, 7567, 7568, 7569],
+                "ports": [7526, 7562, 7563, 7564, 7565, 7566, 7567, 7568, 7569],
             },
             "bluenet": {  # tlm relay
                 "params": ["bluenet"],
                 "ports": [7526],
+            },
+            "censipam": {
+                "params": ["censipam"],
+                "ports": [7562],
             },
             "astralintu": {
                 "params": ["astralintu"],
@@ -110,6 +115,7 @@ class IalirtProcessing(Construct):
             "noaa": {
                 "params": ["noaa"],
                 "ports": [7565],
+                "allow_icmp": True,
             },
             "uksa": {
                 "params": ["uksa"],
@@ -143,6 +149,12 @@ class IalirtProcessing(Construct):
                         connection=ec2.Port.tcp(port),
                         description=f"Allow outbound traffic to {partner} "
                         f"on TCP port {port}",
+                    )
+                if config.get("allow_icmp") and self.account_name == "dev":
+                    self.ecs_security_group.add_ingress_rule(
+                        peer=ec2.Peer.ipv4(cidr),
+                        connection=ec2.Port.all_icmp(),
+                        description=f"Allow inbound ICMP (ping) from {partner}",
                     )
 
     def add_compute_resources(self):

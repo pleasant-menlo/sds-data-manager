@@ -3,6 +3,7 @@
 import json
 import logging
 import textwrap
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,7 +19,7 @@ class MetaKernel:
         start_time: int,
         end_time: int,
         allowed_spice_types: list[str],
-        min_gap_time: int = 0,
+        gap_tolerances: dict[str, float] | None = None,
     ):
         """Initialize the Metakernel.
 
@@ -31,11 +32,12 @@ class MetaKernel:
         allowed_spice_types: list[str]
             A list of strings that represent the allowed types of SPICE files,
             in order of the priority with which to load them in the metakernel.
-        min_gap_time: int
-            The minimum gap time to ignore in seconds, and assume SPICE can
-            interpolate well enough over this small gap.
+        gap_tolerances: dict[str, float], optional
+            For each SPICE type, the longest gap in seconds to ignore where one
+            file's data ends and another's begins. Types not listed tolerate no
+            gaps.
         """
-        self.minimum_gap_time_to_ignore = min_gap_time
+        self.gap_tolerances = gap_tolerances or {}
         self.start_time_j2000 = start_time
         self.end_time_j2000 = end_time
         self.spice_files = {}
@@ -63,7 +65,7 @@ seconds since J2000.
         files: list[dict],
         spice_type: str,
         file_intervals_field: str,
-        priority_field: str = "",
+        priority_fields: Sequence[str] = (),
     ):
         """Load the best SPICE files of a specific type into the Metakernel.
 
@@ -92,18 +94,20 @@ seconds since J2000.
                 {file_intervals} - A list of lists/tuples of 2 elements. The values
                                    can be anything that can be compared with the
                                    ">" or "<" operators.
-                {priority} - An optionial priority to help resolve conflicts within
-                             a single load_spice() call. This can be anything that can
-                             be sorted.
+                {priority_fields} - Optional fields that rank files within a single
+                                    load_spice() call. Each can be anything that
+                                    can be sorted.
             Other items are allowed in the dictionary and will be returned by the
             other Metakernel function calls.
         spice_type: str
             Tells that metakernel the type of files you are loading.
         file_intervals_field: str
             The field that contains the file intervals to sort on.
-        priority_field: str
-            (Optional) The field in the files dictionary to help this function
-            determine the best file to cover the gap, in case of multiple matches.
+        priority_fields: Sequence[str]
+            (Optional) Fields in the files dictionary that rank the files, so the
+            best file covers a gap when several could. Higher values win. Files
+            are compared on the first field, and each later field only breaks
+            ties in the ones before it.
 
         """
         if spice_type not in self.allowed_spice_types:
@@ -113,8 +117,10 @@ seconds since J2000.
 
         # Sort the files in reverse order of priority
         # The "best" file to check will be at index 0, the "second best" at index 1, etc
-        if priority_field:
-            files.sort(key=lambda x: x[priority_field], reverse=True)
+        if priority_fields:
+            files.sort(
+                key=lambda f: tuple(f[field] for field in priority_fields), reverse=True
+            )
 
         # Check each file individually to determine if it should be added to the MK
         for f in files:
@@ -173,13 +179,10 @@ seconds since J2000.
 
         # This variable will contain all gaps that exist after checking this file
         new_gaps = []
+        gap_tolerance = self.gap_tolerances.get(spice_type, 0)
 
         # Loop through all gaps.
         for gap in self.spice_gaps[spice_type]:
-            if gap[1] - gap[0] < self.minimum_gap_time_to_ignore:
-                # Ignore this gap if it is small enough
-                continue
-
             # Before checking any further, do a preliminary check.
             # Does the maximum and minimum time in this file cover any
             # portion of this gap? If not, don't check each interval individually.
@@ -226,8 +229,17 @@ seconds since J2000.
                 # Check if we've already added it. No need to add it again.
                 if file_to_check not in self.spice_files[spice_type]:
                     self.spice_files[spice_type].append(file_to_check)
-                # Add any of these "subgaps" to the new list of gaps.
-                new_gaps.extend(subgap_list)
+                # Add any of these "subgaps" to the new list of gaps, except seams
+                # between files that are within the tolerance. A gap at either end
+                # of the query window is never a seam, since no file is on the
+                # other side of it, so it is always kept.
+                new_gaps.extend(
+                    subgap
+                    for subgap in subgap_list
+                    if subgap[1] - subgap[0] > gap_tolerance
+                    or subgap[0] == self.start_time_j2000
+                    or subgap[1] == self.end_time_j2000
+                )
 
         # Ensure no duplicated gaps exist by called "set".
         self.spice_gaps[spice_type] = list(set(new_gaps))
@@ -315,11 +327,11 @@ seconds since J2000.
         return results
 
     @staticmethod
-    def _calculate_gaps(file_intervals, gap_start, gap_end):  # noqa: PLR0912
-        """Caclulate the gaps based on file_intervals.
+    def _calculate_gaps(file_intervals, gap_start, gap_end):
+        """Calculate the parts of a gap that a file's intervals don't cover.
 
-        Slide a "window" across the file to determine the intervals
-        that remain uncovered between gap_start and gap_end.
+        Subtract the file's valid intervals from the gap, keeping every
+        returned gap within [gap_start, gap_end].
 
         A visual representation:
 
@@ -330,15 +342,9 @@ seconds since J2000.
           |----------|   |------------------|   |--------------------------|
            interval 1         interval 2                interval 3
 
-        The calculated search windows:
-        |----------------|----------------------|---------------------------------|
-        search window 1     search window 2               search window 3
-
         The calculated gaps:
-        |-|          |---|                   |--|                           |-----|
-        gap 1        gap 2                   gap 3                           gap 4
-
-        This function then returns this list of calculated gap intervals
+        |-|          |---|                  |---|                          |------|
+        gap 1        gap 2                  gap 3                           gap 4
 
         Parameters
         ----------
@@ -352,59 +358,25 @@ seconds since J2000.
         Return
         ------
         remaining_gaps: list[tuple[Any, Any]]
-            The gaps definitely not covered by this file.
+            The gaps definitely not covered by this file, in time order.
         """
-        sub_gaps = []
-        for i in range(0, len(file_intervals)):
-            file_interval_start = file_intervals[i][0]
-            file_interval_end = file_intervals[i][1]
-
-            # Determine the search window
-            if (
-                file_interval_start <= gap_start and file_interval_end >= gap_start
-            ) or i == 0:
-                search_window_start = gap_start
-            else:
-                search_window_start = file_intervals[i - 1][1]
-            if (
-                file_interval_start <= gap_end and file_interval_end >= gap_end
-            ) or i == len(file_intervals) - 1:
-                search_window_end = gap_end
-            else:
-                search_window_end = file_intervals[i][1]
-
-            # Quick check, are we out of bounds of the range we care about?
-            # <---- search window ----->
-            #                               <----- gap span ------>
-            if search_window_start >= gap_end or search_window_end <= gap_start:
-                continue
-
-            # Another quick check, does this already interval cover everything
-            # we're looking for?
-            #      <------- gap span ------------>
-            # <--------- file coverage -------------------->
-            if file_interval_start <= gap_start and file_interval_end >= gap_end:
-                return []  # Return here, no gaps to needed to fill
-
-            # Calculate and append gaps to the list
-            if file_interval_start > search_window_start:
-                # <----------- search window --------....
-                #       <----- file coverage --------....
-                if search_window_start < gap_start:
-                    start = gap_start
-                else:
-                    start = search_window_start
-                sub_gaps.extend([(start, file_interval_start)])  # Gaps before interval
-            if file_interval_end < search_window_end:
-                # ....--- search window --------------->
-                # ....-- file coverage -------->
-                if search_window_end > gap_end:
-                    end = gap_end
-                else:
-                    end = search_window_end
-                sub_gaps.extend([(file_interval_end, end)])  # Gaps after interval
-
-        return sub_gaps
+        remaining_gaps = []
+        # Everything before `cursor` is either covered by the file or already
+        # recorded as a remaining gap.
+        cursor = gap_start
+        for interval_start, interval_end in sorted(file_intervals):
+            if interval_end <= cursor:
+                continue  # Entirely before the uncovered part of the gap
+            if interval_start >= gap_end:
+                break  # This and every later interval is after the gap
+            if interval_start > cursor:
+                remaining_gaps.append((cursor, interval_start))
+            cursor = interval_end
+            if cursor >= gap_end:
+                break
+        if cursor < gap_end:
+            remaining_gaps.append((cursor, gap_end))
+        return remaining_gaps
 
     def __repr__(self):
         """Return all loaded SPICE files as JSON."""

@@ -1,0 +1,274 @@
+"""Configure the ialirt SSR processing construct."""
+
+import aws_cdk as cdk
+from aws_cdk import RemovalPolicy
+from aws_cdk import aws_dynamodb as ddb
+from aws_cdk import aws_ec2 as ec2
+from aws_cdk import aws_ecr_assets as ecr_assets
+from aws_cdk import aws_events as events
+from aws_cdk import aws_events_targets as targets
+from aws_cdk import aws_iam as iam
+from aws_cdk import aws_lambda as lambda_
+from aws_cdk import aws_lambda_event_sources as lambda_event_sources
+from aws_cdk import aws_sqs as sqs
+from aws_cdk import aws_ssm as ssm
+from constructs import Construct
+
+# One Lambda per instrument, plus spacecraft status and position/velocity.
+SSR_INSTRUMENTS = [
+    "mag",
+    "hit",
+    "swe",
+    "codice_lo",
+    "codice_hi",
+    "swapi",
+    "spacecraft_status",
+    "spacecraft",
+]
+# Holds a prod API key, since SSR always reads prod data.
+API_KEY_PARAMETER_NAME = "/imap-sdc/ialirt-ssr/api-key"
+
+
+class IalirtSsrConstruct(Construct):
+    """Construct for ialirt SSR processing resources."""
+
+    def __init__(
+        self,
+        scope: Construct,
+        construct_id: str,
+        account_name: str,
+        vpc: ec2.Vpc,
+        docker_path: str = "sds_data_manager/lambda_code",
+        data_access_url: str = "",
+        **kwargs,
+    ) -> None:
+        """IalirtSsrConstruct Stack.
+
+        Parameters
+        ----------
+        scope : Construct
+            Parent construct.
+        construct_id : str
+            A unique string identifier for this construct.
+        account_name : str
+            The account name. Eg. 'prod' or 'dev'
+        vpc : ec2.Vpc
+            VPC into which to put the resources that require networking.
+        docker_path : str
+            Path to the Dockerfile.
+        data_access_url : str, optional
+            The prod data access URL, https://api.imap-mission.com. SSR reads
+            prod data in every account.
+        kwargs : dict
+            Keyword arguments.
+
+        """
+        super().__init__(scope, construct_id, **kwargs)
+
+        self.account_name = account_name
+        self.vpc = vpc
+
+        # Create DynamoDB Table
+        self.ssr_table = self.create_table()
+
+        # Create one Lambda per instrument, each fed by its own queue
+        self.ssr_queues = {}
+        self.ssr_lambdas = self.create_lambda_functions(docker_path, data_access_url)
+
+        # Create the Lambda that queues the instrument runs per day
+        self.dispatch_lambda = self.create_dispatch_lambda(docker_path, data_access_url)
+
+        # Create the daily and manual triggers
+        self.create_event_rules()
+
+    def create_table(self) -> ddb.Table:
+        """Create and return the SSR data product table."""
+        removal_policy = (
+            RemovalPolicy.RETAIN
+            if self.account_name == "prod"
+            else RemovalPolicy.DESTROY
+        )
+        point_in_time_recovery = True if self.account_name == "prod" else False
+
+        self.ssr_table = ddb.Table(
+            self,
+            "IalirtSsrTable",
+            table_name="ialirt-ssr-table",
+            # RemovalPolicy.RETAIN to keep the table after stack deletion.
+            removal_policy=removal_policy,
+            # Restore data to any point in time within the last 35 days.
+            point_in_time_recovery=point_in_time_recovery,
+            # Partition key (PK) = instrument and version, e.g. "mag#v001".
+            # Including the version lets each version be stored and
+            # queried separately instead of overwriting the previous one.
+            partition_key=ddb.Attribute(
+                name="instrument_version",
+                type=ddb.AttributeType.STRING,
+            ),
+            # Sort key (SK) = time_utc.
+            sort_key=ddb.Attribute(
+                name="time_utc",
+                type=ddb.AttributeType.STRING,
+            ),
+            billing_mode=ddb.BillingMode.PAY_PER_REQUEST,  # On-Demand capacity mode.
+        )
+
+        return self.ssr_table
+
+    def create_lambda_functions(
+        self,
+        docker_path: str,
+        data_access_url: str,
+    ) -> dict[str, lambda_.DockerImageFunction]:
+        """Create one Lambda per instrument from a shared image."""
+        lambda_role = iam.Role(
+            self,
+            "IalirtSsrLambdaRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "service-role/AWSLambdaBasicExecutionRole"
+                ),
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "service-role/AWSLambdaVPCAccessExecutionRole"
+                ),
+            ],
+        )
+        self.ssr_table.grant_read_write_data(lambda_role)
+
+        # Unreleased L0 files are only returned to queries with an API key.
+        self.api_key_parameter = (
+            ssm.StringParameter.from_secure_string_parameter_attributes(
+                self,
+                "ApiKeyParameter",
+                parameter_name=API_KEY_PARAMETER_NAME,
+            )
+        )
+        self.api_key_parameter.grant_read(lambda_role)
+
+        code = lambda_.DockerImageCode.from_image_asset(
+            docker_path,
+            file="IAlirtCode/Dockerfile.ssr",
+            platform=ecr_assets.Platform.LINUX_AMD64,
+        )
+
+        ssr_lambdas = {}
+        for instrument in SSR_INSTRUMENTS:
+            ssr_lambda = lambda_.DockerImageFunction(
+                self,
+                id=f"IalirtSsrLambda-{instrument}",
+                code=code,
+                function_name=f"ialirt-ssr-{instrument.replace('_', '-')}",
+                timeout=cdk.Duration.minutes(15),
+                # Estimated peak is ~600-900 MB (parsing two days of packets).
+                # 2048 MB also gives more than one vCPU.
+                memory_size=2048,
+                # Packets (~29 MB for day + next day), SPICE kernels
+                # (de440.bsp alone is ~114 MB) and ancillary files are
+                # downloaded to /tmp on every invocation.
+                ephemeral_storage_size=cdk.Size.gibibytes(2),
+                role=lambda_role,
+                vpc=self.vpc,
+                vpc_subnets=ec2.SubnetSelection(
+                    subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+                ),
+                environment={
+                    "INSTRUMENT": instrument,
+                    "SSR_TABLE": self.ssr_table.table_name,
+                    "IMAP_DATA_ACCESS_URL": data_access_url,
+                    "SSM_API_KEY_PARAMETER": API_KEY_PARAMETER_NAME,
+                },
+            )
+            ssr_lambda.apply_removal_policy(RemovalPolicy.DESTROY)
+            ssr_lambdas[instrument] = ssr_lambda
+
+            # Every message uses the same message group, so a FIFO queue
+            # runs one day of an instrument at a time. This keeps backfills
+            # from throttling the instrument's partition key.
+            queue = sqs.Queue(
+                self,
+                f"IalirtSsrQueue-{instrument}",
+                queue_name=f"ialirt-ssr-{instrument.replace('_', '-')}.fifo",
+                fifo=True,
+                # Messages with the same body sent within 5 minutes are
+                # dropped as duplicates.
+                content_based_deduplication=True,
+                # Longer than the Lambda timeout, so a message is not
+                # received again while it is still being processed.
+                visibility_timeout=cdk.Duration.minutes(16),
+            )
+            queue.apply_removal_policy(RemovalPolicy.DESTROY)
+            ssr_lambda.add_event_source(
+                lambda_event_sources.SqsEventSource(queue, batch_size=1)
+            )
+            self.ssr_queues[instrument] = queue
+
+        return ssr_lambdas
+
+    def create_dispatch_lambda(
+        self, docker_path: str, data_access_url: str
+    ) -> lambda_.DockerImageFunction:
+        """Create the Lambda that queues the instrument runs per day.
+
+        It uses the instrument image so it can run the same coverage check
+        before invoking them.
+        """
+        dispatch_lambda = lambda_.DockerImageFunction(
+            self,
+            "IalirtSsrDispatchLambda",
+            function_name="ialirt-ssr-dispatcher",
+            code=lambda_.DockerImageCode.from_image_asset(
+                docker_path,
+                file="IAlirtCode/Dockerfile.ssr",
+                cmd=["ialirt_ssr_dispatch.lambda_handler"],
+                platform=ecr_assets.Platform.LINUX_AMD64,
+            ),
+            timeout=cdk.Duration.minutes(15),
+            # Parses three days of packets at a time for the coverage check.
+            memory_size=3008,
+            ephemeral_storage_size=cdk.Size.gibibytes(2),
+            vpc=self.vpc,
+            vpc_subnets=ec2.SubnetSelection(
+                subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+            ),
+            environment={
+                "SSR_TABLE": self.ssr_table.table_name,
+                "IMAP_DATA_ACCESS_URL": data_access_url,
+                "SSM_API_KEY_PARAMETER": API_KEY_PARAMETER_NAME,
+            },
+            retry_attempts=0,
+        )
+        # Read access to skip days that are already processed.
+        self.ssr_table.grant_read_data(dispatch_lambda)
+        self.api_key_parameter.grant_read(dispatch_lambda)
+        for queue in self.ssr_queues.values():
+            queue.grant_send_messages(dispatch_lambda)
+        dispatch_lambda.apply_removal_policy(RemovalPolicy.DESTROY)
+        return dispatch_lambda
+
+    def create_event_rules(self) -> None:
+        """Create the daily and manual triggers for the dispatch Lambda."""
+        # Daily: process days completed by recently ingested L0 files. Prod
+        # only, since SSR reads prod data and dev processes days manually.
+        if self.account_name == "prod":
+            daily_rule = events.Rule(
+                self,
+                "IalirtSsrDailyRule",
+                rule_name="ialirt-ssr-daily",
+                schedule=events.Schedule.cron(minute="0", hour="6"),
+            )
+            daily_rule.add_target(targets.LambdaFunction(self.dispatch_lambda))
+
+        # Manual trigger: put a custom event on the default event bus, e.g.
+        # Source "imap.ialirt.ssr", DetailType "SSR Processing Request",
+        # Detail {"start_date": "20260901", "end_date": "20260910"}.
+        manual_rule = events.Rule(
+            self,
+            "IalirtSsrManualRule",
+            rule_name="ialirt-ssr-manual",
+            event_pattern=events.EventPattern(
+                source=["imap.ialirt.ssr"],
+                detail_type=["SSR Processing Request"],
+            ),
+        )
+        manual_rule.add_target(targets.LambdaFunction(self.dispatch_lambda))

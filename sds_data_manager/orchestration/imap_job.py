@@ -96,6 +96,7 @@ priority_levels = {
 partition_map = {
     "daily": custom_partitions.daily_partitions,
     "repoint": custom_partitions.repoint_partitions,
+    "pointing_attitude": custom_partitions.pointing_attitude_partitions,
     "10d": custom_partitions.idex10_partitions,
 } | custom_partitions.CADENCE_PARTITION_DEFS
 
@@ -128,7 +129,7 @@ class IMAPJobHandler:
         job : ProcessingJobNode
             The job node to process.
         """
-        self.BATCH_JOB_TIMEOUT_SECONDS = 18000  # 5 hours
+        self.BATCH_JOB_TIMEOUT_SECONDS = 54000  # 15 hours
         self.WAIT_TIME_AFTER_BATCH_SECONDS = (
             60  # time to wait after a batch job completes to search for files.
         )
@@ -185,16 +186,19 @@ class IMAPJobHandler:
 
         This function will:
 
-        1) Get all dependencies from the dependency tree
-        2) Check if the job had been submitted before
-           a) If it has, and Dagster doesn't know about it, then it will materialize
-              the asset
-           b) If Dagster does know about it, we exit
-        3) Get the Job version
-        4) Submit the job
-        5) Wait for the output files,
+        1) Get all dependencies from the dependency tree. If any are missing,
+           report an AssetObservation for each output and exit.
+        2) Determine major and minor versions of all job outputs.
+        3) Try to submit the job. If a job with the same dependencies was
+           submitted before, the submission is skipped: report an
+           AssetObservation for each output and exit without materializing
+           anything. The run that did the processing owns the materialization.
+        4) Wait for the output files,
            and materialize them as we see them in the database.
 
+        If this run is interrupted before step 4, or the indexer is slow to record
+        the outputs, the job_output_backup_materialization_sensor will eventually
+        materialize them instead (without the inputs metadata).
         """
         # Before doing anything, check if any of the dependencies are currently
         # running or about to run.
@@ -242,6 +246,7 @@ class IMAPJobHandler:
                 session=session,
                 start_date=target_start,
                 repointing=target_pointing_number,
+                dependency_inputs=dependency_inputs,
             )
             context.log.info(f"Job Versions to Use: {output_versions}")
 
@@ -278,25 +283,21 @@ class IMAPJobHandler:
                     repointing=target_pointing_number,
                     inputs=dependency_inputs.serialize(),
                 )
-                for f in output_files:
-                    yield f
+                yield from output_files
                 if batch_status == models.Status.FAILED:
                     raise Failure(
                         description="Batch Job Failure. View logs for details."
                     )
             elif submit_response.status == "skipped":
-                # If we skipped the job, let us materialize any previous outputs
-                # so that we ensure dagster knows about them
-
-                output_files = self.find_outputs(
-                    context,
-                    session,
-                    start_date=target_start,
-                    repointing=target_pointing_number,
-                    inputs=dependency_inputs.serialize(),
-                )
-                for f in output_files:
-                    yield f
+                context.log.info("Skipped - Duplicated Job")
+                for output in self.job_config.outputs:
+                    yield AssetObservation(
+                        asset_key=output.to_dagster_asset(),
+                        partition=context.partition_key,
+                        metadata={
+                            "status": "Skipped - Duplicated Job",
+                        },
+                    )
             else:
                 raise Failure(description=submit_response.message)
 
@@ -362,6 +363,14 @@ class IMAPJobHandler:
                 "The job may have failed before the container could start."
             )
 
+        # If the job failed, log why so we don't have to go to the batch console.
+        if final_status == models.Status.FAILED:
+            context.log.info(
+                f"Batch job status reason: {job_info.get('statusReason')}, "
+                f"container exit code: {container_info.get('exitCode')}, "
+                f"container reason: {container_info.get('reason')}"
+            )
+
         # Gather information about start/stop timing
         started_at_timestamp = job_info.get("startedAt", job_info.get("createdAt"))
         stopped_at_timestamp = job_info.get("stoppedAt")
@@ -413,57 +422,149 @@ class IMAPJobHandler:
             )
 
         for output in self.job_config.outputs:
-            filters = [
-                models.ScienceFiles.instrument == output.source,
-                models.ScienceFiles.data_level == output.data_type,
-                models.ScienceFiles.descriptor == output.descriptor,
-            ]
-            if output_versions is not None:
-                if output.descriptor in output_versions.keys():
-                    versions = output_versions[output.descriptor]
-                    filters.append(
-                        models.ScienceFiles.major_version == versions["major_version"]
-                    )
-                    filters.append(
-                        models.ScienceFiles.minor_version == versions["minor_version"]
-                    )
-            if repointing is not None:
-                filters.append(models.ScienceFiles.repointing == int(repointing))
-            if start_date is not None:
-                filters.append(models.ScienceFiles.start_date == start_date.date())
-            created_file = (
-                session.query(models.ScienceFiles)
-                .filter(*filters)
-                .distinct(
-                    models.ScienceFiles.start_date,
-                    models.ScienceFiles.repointing,
-                )
-                .order_by(
-                    models.ScienceFiles.start_date,
-                    models.ScienceFiles.repointing,
-                    models.ScienceFiles.major_version.desc(),
-                    models.ScienceFiles.minor_version.desc(),
-                )
-                .first()
+            find_output = (
+                self._find_ancillary_output
+                if output.data_type == "ancillary"
+                else self._find_science_output
             )
-            if created_file:
-                context.log.info(
-                    f"""Found file {os.path.basename(created_file.file_path)}!
-                        Creating Asset.
-                    """
-                )
-                materialization = get_materialization_result(
-                    context,
-                    output.to_dagster_asset(),
-                    context.partition_key,
-                    [os.path.basename(created_file.file_path)],
-                    Version(created_file.major_version, created_file.minor_version),
-                    "science",
-                    inputs=inputs,
-                )
-                if materialization:
-                    output_materializations.append(materialization)
+            materialization = find_output(
+                context,
+                session,
+                output,
+                output_versions=output_versions,
+                start_date=start_date,
+                repointing=repointing,
+                inputs=inputs,
+            )
+            if materialization:
+                output_materializations.append(materialization)
         return output_materializations
+
+    def _find_science_output(
+        self,
+        context,
+        session: db.Session,
+        output,
+        output_versions: dict | None = None,
+        start_date: datetime.datetime | None = None,
+        repointing: int | None = None,
+        inputs: dict | None = None,
+    ):
+        """Return the materialization for a single science output, if found."""
+        filters = [
+            models.ScienceFiles.instrument == output.source,
+            models.ScienceFiles.data_level == output.data_type,
+            models.ScienceFiles.descriptor == output.descriptor,
+        ]
+
+        if output_versions is not None and output.descriptor in output_versions:
+            versions = output_versions[output.descriptor]
+            filters.append(
+                models.ScienceFiles.major_version == versions["major_version"]
+            )
+            filters.append(
+                models.ScienceFiles.minor_version == versions["minor_version"]
+            )
+
+        if repointing is not None:
+            filters.append(models.ScienceFiles.repointing == int(repointing))
+
+        if start_date is not None:
+            filters.append(models.ScienceFiles.start_date == start_date.date())
+
+        created_file = (
+            session.query(models.ScienceFiles)
+            .filter(*filters)
+            .distinct(
+                models.ScienceFiles.start_date,
+                models.ScienceFiles.repointing,
+            )
+            .order_by(
+                models.ScienceFiles.start_date,
+                models.ScienceFiles.repointing,
+                models.ScienceFiles.major_version.desc(),
+                models.ScienceFiles.minor_version.desc(),
+            )
+            .first()
+        )
+
+        if not created_file:
+            return None
+
+        context.log.info(
+            f"""Found file {os.path.basename(created_file.file_path)}!
+                Creating Asset.
+            """
+        )
+
+        return get_materialization_result(
+            context,
+            output.to_dagster_asset(),
+            context.partition_key,
+            [os.path.basename(created_file.file_path)],
+            Version(created_file.major_version, created_file.minor_version),
+            "science",
+            inputs=inputs,
+        )
+
+    def _find_ancillary_output(
+        self,
+        context,
+        session: db.Session,
+        output,
+        output_versions: dict | None = None,
+        start_date: datetime.datetime | None = None,
+        repointing: int | None = None,
+        inputs: dict | None = None,
+    ):
+        """Return the materialization for a single ancillary output, if found."""
+        filters = [
+            models.AncillaryFiles.instrument == output.source,
+            models.AncillaryFiles.descriptor == output.descriptor,
+        ]
+
+        # When we know the version the job just produced, match it exactly. The
+        # ancillary version string carries only the (bumped) minor version.
+        if output_versions is not None and output.descriptor in output_versions:
+            minor_version = output_versions[output.descriptor]["minor_version"]
+            filters.append(
+                models.AncillaryFiles.version == str(Version(None, minor_version))
+            )
+
+        if repointing is not None:
+            filters.append(models.AncillaryFiles.repointing == int(repointing))
+
+        if start_date is not None:
+            filters.append(models.AncillaryFiles.start_date == start_date.date())
+
+        created_file = (
+            session.query(models.AncillaryFiles)
+            .filter(*filters)
+            .order_by(models.AncillaryFiles.version.desc())
+            .first()
+        )
+
+        if not created_file:
+            return None
+
+        context.log.info(
+            f"""Found file {os.path.basename(created_file.file_path)}!
+                Creating Asset.
+            """
+        )
+
+        # The major version is config-driven; the minor version comes from the
+        # file's "vXXX" version string.
+        minor_version = Version.from_version(created_file.version).minor
+        return get_materialization_result(
+            context,
+            output.to_dagster_asset(),
+            context.partition_key,
+            [os.path.basename(created_file.file_path)],
+            Version(output.major_version, minor_version),
+            "ancillary",
+            inputs=inputs,
+        )
 
     def _check_for_running_dependencies(self, context):
         """Check if anything upstream of this file is currently running."""
@@ -523,11 +624,27 @@ class IMAPJobHandler:
             if not down_start or not down_end:
                 continue
 
-            # Math logic for overlapping date intervals
-            if up_start <= down_end and up_end >= down_start:
+            # Partition windows that only meet at a boundary are adjacent, not
+            # overlapping. An exact partition-key match was handled above.
+            if up_start < down_end and up_end > down_start:
                 target_keys.append(down_key)
 
         return target_keys
+
+    def _dependency_uses_same_partition_def(self, dependency: DependencyNode) -> bool:
+        """Return whether an input asset uses this job's partition definition."""
+        if self.partitions_def is None:
+            return False
+
+        # Import locally to avoid a circular import while imap_dagster builds defs.
+        from sds_data_manager.orchestration.imap_dagster import defs  # noqa: PLC0415
+
+        dependency_partitions_def = (
+            defs.get_repository_def()
+            .asset_graph.get(dependency.to_dagster_asset())
+            .partitions_def
+        )
+        return dependency_partitions_def == self.partitions_def
 
     def build_sensor(self):
         """Return a Dagster sensor monitoring for new dependencies.
@@ -605,43 +722,9 @@ class IMAPJobHandler:
                     )
                 # Now we loop through each partition that we received new data for, and
                 # determine if we need to start it again.
-                for target_partition in target_partitions:
-                    # Check if this partition has already been run successfully
-                    runs = context.instance.get_runs(
-                        filters=RunsFilter(
-                            job_name=self.dagster_job_name,
-                            statuses=[DagsterRunStatus.SUCCESS],
-                            tags={"dagster/partition": target_partition},
-                        ),
-                        limit=1,  # Limit to 1 since we only care about existence
-                    )
-
-                    # If this has never been run,
-                    # or we always trigger from this dependency
-                    if (dep_name in self.triggering_input_names) or not runs:
-                        run_key = "_".join(
-                            [
-                                self.job_config.to_dagster_name(),
-                                target_partition,
-                                job_suffix,
-                            ]
-                        )
-                        context.log.info(
-                            f"""Yielding a run request with ID:
-                               {run_key} on partition {target_partition}.
-                               """
-                        )
-
-                        # Go to _generic_batch_sumbitter
-                        yield RunRequest(
-                            partition_key=target_partition, run_key=run_key
-                        )
-
-                    elif runs and (dep_name not in self.triggering_input_names):
-                        context.log.info(
-                            """"We have already materialized something like this,
-                            and this dependency does not trigger new processing."""
-                        )
+                yield from self._yield_run_requests_for_partitions(
+                    context, target_partitions, dependency, job_suffix
+                )
 
                 if (time.time() - sensor_start_time) > 30:
                     context.log.info(
@@ -653,6 +736,63 @@ class IMAPJobHandler:
             context.update_cursor(json.dumps(new_cursors))
 
         return _sensor
+
+    def _yield_run_requests_for_partitions(
+        self,
+        context: SensorEvaluationContext,
+        target_partitions: list[str],
+        dependency: DependencyNode,
+        job_suffix: str,
+    ):
+        """Yield a RunRequest for each partition that should be (re)triggered.
+
+        A partition is triggered if either it has never had a successful run
+        of this job, or `dependency` is one of this job's
+        `triggering_input_names` (configured to always cause reprocessing
+        regardless of prior successful runs).
+
+        `job_suffix` should be computed once per sensor tick and reused
+        across every dependency/partition evaluated in that tick, so a
+        partition considered more than once in the same tick collapses to
+        the same `run_key` and Dagster's run-key idempotency check prevents
+        a double-fire.
+        """
+        dep_name = dependency.to_dagster_name()
+        for target_partition in target_partitions:
+            # Check if this partition has already been run successfully
+            runs = context.instance.get_runs(
+                filters=RunsFilter(
+                    job_name=self.dagster_job_name,
+                    statuses=[DagsterRunStatus.SUCCESS],
+                    tags={"dagster/partition": target_partition},
+                ),
+                limit=1,  # Limit to 1 since we only care about existence
+            )
+
+            # If this has never been run,
+            # or we always trigger from this dependency
+            if (dep_name in self.triggering_input_names) or not runs:
+                run_key = "_".join(
+                    [
+                        self.job_config.to_dagster_name(),
+                        target_partition,
+                        job_suffix,
+                    ]
+                )
+                context.log.info(
+                    f"""Yielding a run request with ID:
+                       {run_key} on partition {target_partition}.
+                       """
+                )
+
+                # Go to _generic_batch_sumbitter
+                yield RunRequest(partition_key=target_partition, run_key=run_key)
+
+            elif runs and (dep_name not in self.triggering_input_names):
+                context.log.info(
+                    """"We have already materialized something like this,
+                    and this dependency does not trigger new processing."""
+                )
 
     def trigger_from_new_non_science_inputs(
         self,
@@ -758,11 +898,17 @@ class IMAPJobHandler:
             filter, limit=100, ascending=True
         )
 
+        dependency_uses_same_partition_def = bool(new_events) and (
+            self._dependency_uses_same_partition_def(dependency)
+        )
+        existing_target_partitions = (
+            set(context.instance.get_dynamic_partitions(self.partitions_def.name))
+            if dependency_uses_same_partition_def
+            else set()
+        )
+
         partitions_to_run = []
         for record in new_events:
-            # Update our new cursor marker to the highest storage ID seen
-            last_event_id = max(last_event_id, record.storage_id)
-
             # Get the dates of this new science file
             upstream_partition_key = record.event_log_entry.dagster_event.partition
             up_start, up_end = dagster_utilities.parse_dates_from_partition_key(
@@ -773,7 +919,27 @@ class IMAPJobHandler:
                  {record.event_log_entry.dagster_event.partition}!"""
             )
             if not up_start or not up_end:
+                # This event cannot map to a time-based partition, so consume it.
+                last_event_id = max(last_event_id, record.storage_id)
                 continue
+
+            if (
+                dependency_uses_same_partition_def
+                and upstream_partition_key not in existing_target_partitions
+            ):
+                # The input and target use the same dynamic partition set, but
+                # this key has not been registered yet. Keep the cursor before
+                # this event so the sensor retries it after the partition sensor
+                # catches up. Falling back to date overlap here can incorrectly
+                # select an adjacent partition at a shared boundary.
+                context.log.info(
+                    f"Deferring dependency partition {upstream_partition_key}; "
+                    "the matching target partition is not registered yet."
+                )
+                break
+
+            # Update our new cursor marker only once this event is processable.
+            last_event_id = max(last_event_id, record.storage_id)
 
             # Kick off jobs in a range around the file
             # TODO: This is probably too broad. But for now, this
@@ -890,14 +1056,28 @@ class IMAPJobHandler:
 
     def get_spice_file_inputs(self, session, target_start, target_end):
         """Return the spice files needed to cover a time range."""
-        spice_files = spice.get_upstream_dependency_inputs_spice(
+        spice_files, missing_kernel_types = spice.get_upstream_dependency_inputs_spice(
             self.job_config.spice_types, target_start, target_end
         )
-        if not spice_files and self.job_config.spice_inputs:
-            # If no SPICE files are returned, but there are SPICE inputs, raise failure
+        if (
+            missing_kernel_types
+            and len(missing_kernel_types) > 0
+            and self.job_config.spice_inputs
+        ):
+            # If there are missing kernels, raise failure
             raise MissingDependenciesError(
-                f"Missing SPICE files ({', '.join(self.job_config.spice_types)}) "
+                f"Missing SPICE kernel types: {', '.join(missing_kernel_types)} "
+                f"Found the following files: {', '.join(spice_files)} "
                 f"between {target_start} and {target_end}"
+            )
+        # spice_files is only None when the metakernel API returned a non-200
+        # response.
+        if spice_files is None:
+            raise MissingDependenciesError(
+                f"The Metakernel API request failed when querying for kernel "
+                f"types: {', '.join(self.job_config.spice_types)} "
+                f"between {target_start} and {target_end}. "
+                f"Check the metakernel api logs."
             )
 
         return spice_files
@@ -944,11 +1124,11 @@ class IMAPJobHandler:
                     processing_input.ScienceInput(*list(set(renamed_science_files)))
                 )
 
-        if not science_processing_inputs:
-            # Return right away if we have zero science files.
+        if not science_processing_inputs and self.job_config.science_inputs:
+            # Science inputs were configured but none were found.
             raise MissingDependenciesError(
                 f"No science files were discovered between {target_start} and "
-                f"{target_end}. All jobs require at least one science file."
+                f"{target_end}. This job require at least one science file."
             )
 
         return science_processing_inputs
@@ -1009,12 +1189,16 @@ class IMAPJobHandler:
         session: db.Session,
         start_date: datetime,
         repointing: int | None = None,
+        dependency_inputs: processing_input.ProcessingInputCollection | None = None,
     ) -> dict[str, dict[str, int]]:
         """Determine the major and minor version to use for each output product.
 
         The major version for each output comes directly from the dependency
-        config and is not bumped here. The minor version is the maximum minor
-        version already seen in the pipeline for this job, increased by one.
+        config and is not bumped here. The minor version is shared across all
+        outputs of a job: it is the maximum of (a) the minor version already
+        seen in the processing jobs table for this job, and (b) the largest
+        minor version already seen in the science or ancillary files table
+        across all of this job's outputs, increased by one.
 
         Parameters
         ----------
@@ -1025,6 +1209,13 @@ class IMAPJobHandler:
         repointing : int, optional
             Repointing number. Versions are tracked independently per repointing so
             that multiple repoints on the same day each start at minor version 1.
+        dependency_inputs : ProcessingInputCollection, optional
+            This run's already-resolved dependencies, as computed by
+            get_dependencies(). Unused by the base implementation; available so
+            a subclass can version its output off the actual resolved
+            dependency files (e.g. a specific SPICE kernel) rather than a
+            separately-derived value that could disagree with what's really in
+            the dependency JSON.
 
         Returns
         -------
@@ -1033,15 +1224,17 @@ class IMAPJobHandler:
             with "major_version" and "minor_version" keys.
         """
 
-        def filter_conditions(table):
+        def filter_conditions(table, node):
             # Filter conditions for the query
             conditions = [
-                table.instrument == self.job_config.source,
-                table.data_level == self.job_config.data_type,
-                table.descriptor == self.job_config.descriptor,
+                table.instrument == node.source,
+                table.descriptor == node.descriptor,
                 table.start_date == start_date.date(),
                 table.repointing == repointing,
             ]
+            # The ancillary files table has no data_level column
+            if table != models.AncillaryFiles:
+                conditions.append(table.data_level == node.data_type)
             if table == models.ProcessingJob:
                 conditions.append(
                     table.status.in_(
@@ -1060,70 +1253,88 @@ class IMAPJobHandler:
 
         # Step 1: Query the processing jobs table for the most recent minor
         # version for this instrument/data_level/descriptor/start_date/repointing.
-        # TODO calculate each output products minor versions independently.
-        max_minor_version_record = (
+        max_minor_version_job = (
             session.query(models.ProcessingJob)
-            .filter(*filter_conditions(models.ProcessingJob))
+            .filter(*filter_conditions(models.ProcessingJob, self.job_config))
             .order_by(models.ProcessingJob.minor_version.desc())
             .first()
         )
-        in_progress = False
-        if max_minor_version_record:
-            minor_version_processing_table = max_minor_version_record.minor_version
-            # Step 2: If a job for this exact key is already in progress, flag it
-            # so we fall back to the processing-jobs version below instead of the
-            # science files version. The minor version itself is still bumped by
-            # the shared "+ 1" logic in Step 5; try_to_submit_job() is what
-            # actually prevents duplicate jobs from running.
-            if max_minor_version_record.status == models.Status.INPROGRESS:
-                logger.info(
-                    f"Job with id: {max_minor_version_record.id} is in progress, but "
-                    f"the dependencies have changed. Bumping version number."
-                )
-                in_progress = True
-        else:
-            minor_version_processing_table = None
-
-        # Spacecraft pointing-attitude jobs produce a SPICE kernel rather than a
-        # science file, so there's no science files row to compare against —
-        # we always need to fall back to the processing-jobs table for these.
-        is_spacecraft_job = (
-            self.job_config.source == "spacecraft"
-            and self.job_config.descriptor == "pointing-attitude"
+        max_minor_version_processing_job = (
+            max_minor_version_job.minor_version
+            if max_minor_version_job is not None
+            else None
         )
 
-        # Step 3: If the descriptor is "all", only use the max version from the
-        # processing job table. The ScienceFiles table does not have descriptors
-        # of "all", since the products produced will have their own specific
-        # descriptors. Also use the processing-jobs version if this is a
-        # spacecraft pointing-attitude job, or if a matching job is in progress.
-        if "all" in self.job_config.descriptor or is_spacecraft_job or in_progress:
-            current_minor_version = minor_version_processing_table
-        else:
-            # Step 4: Otherwise, get the max minor version from the science
-            # files table.
-            max_minor_version_sci_table = (
-                session.query(func.max(models.ScienceFiles.minor_version)).filter(
-                    *filter_conditions(models.ScienceFiles)
-                )
-            ).scalar()
+        # Step 2: If a job for this exact key is already in progress, log it.
+        # The minor version itself is still bumped by the shared "+ 1" logic in
+        # Step 4; try_to_submit_job() is what actually prevents duplicate jobs
+        # from running.
+        if (
+            max_minor_version_job is not None
+            and max_minor_version_job.status == models.Status.INPROGRESS
+        ):
+            logger.info(
+                f"Job with id: {max_minor_version_job.id} is in progress. "
+                f"Bumping minor version number."
+            )
 
-            current_minor_version = max_minor_version_sci_table
-
-        # Step 5: Bump the minor version by one (starting at 1 if no prior
-        # version exists). Each output's major version comes directly from the
-        # dependency config and is not bumped.
-        minor_version = (
-            current_minor_version + 1 if current_minor_version is not None else 1
-        )
-        output_versions = {}
+        # Step 3: Get the max minor version already seen in the science or
+        # ancillary files table for each output, and keep the largest across
+        # all outputs of the job.
+        max_minor_version_science_files = None
         for output in outputs:
-            output_versions[output.descriptor] = {
+            if output.data_type == "ancillary":
+                # Ancillary files store the version as a "vXXX" string.
+                # A major version will be passed in anyway, but ignored.
+                max_version = (
+                    session.query(func.max(models.AncillaryFiles.version))
+                    .filter(*filter_conditions(models.AncillaryFiles, output))
+                    .scalar()
+                )
+                current_minor_version = (
+                    Version.from_version(max_version).minor if max_version else None
+                )
+            else:
+                current_minor_version = (
+                    session.query(func.max(models.ScienceFiles.minor_version))
+                    .filter(*filter_conditions(models.ScienceFiles, output))
+                    .scalar()
+                )
+            if current_minor_version is not None and (
+                max_minor_version_science_files is None
+                or current_minor_version > max_minor_version_science_files
+            ):
+                max_minor_version_science_files = current_minor_version
+
+        # Step 4: The minor version to use is the max of the processing jobs
+        # table's minor version (Step 1) and the science files table's minor
+        # version across all outputs (Step 3), bumped by one. Start at 1 if
+        # neither has been created before.
+        minor_version_candidates = [
+            version
+            for version in (
+                max_minor_version_processing_job,
+                max_minor_version_science_files,
+            )
+            if version is not None
+        ]
+        minor_version = (
+            max(minor_version_candidates) + 1 if minor_version_candidates else 1
+        )
+
+        # output.descriptor is not necessarily unique across outputs (e.g. a job
+        # can produce the same descriptor at two data levels).
+        # validate_dependency_yaml_versions (enforced in a github action)
+        # guarantees that any outputs sharing a descriptor also share the
+        # same major_version, and minor_version is the same for every output
+        # here, so it's safe to key this dict by descriptor alone.
+        return {
+            output.descriptor: {
                 "minor_version": minor_version,
                 "major_version": output.major_version,
             }
-
-        return output_versions
+            for output in outputs
+        }
 
     def _dependency_hash(
         self, serialized_dependencies: str, output_versions: dict[str, dict[str, int]]

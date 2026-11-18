@@ -135,7 +135,6 @@ l3a_spice_common: &l3a_spice_common
       data_type: l2
       descriptor: norm-rtn
       required: false
-      trigger_job: false
     - source: swapi
       data_type: ancillary
       descriptor: energy-gf-pui-lut
@@ -159,7 +158,7 @@ l3a_spice_common: &l3a_spice_common
     - source: swapi
       data_type: l3a
       descriptor: alpha-sw
-      major_version: 1
+      major_version: 2
 
 (l3a, proton-sw):
   partition: daily
@@ -192,7 +191,7 @@ l3a_spice_common: &l3a_spice_common
     - source: swapi
       data_type: l3a
       descriptor: proton-sw
-      major_version: 1
+      major_version: 2
 
 (l3a, pui-he):
   partition: daily
